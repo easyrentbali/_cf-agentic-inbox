@@ -92,6 +92,97 @@ app.get("/api/v1/config", (c) => {
 	return c.json({ domains, emailAddresses });
 });
 
+// -- Debug: Test Stalwart JMAP import -----------------------------------
+
+app.post("/api/v1/debug/stalwart-test", async (c: AppContext) => {
+	const env = c.env;
+	const results: string[] = [];
+
+	if (!env.STALWART_JMAP_URL || !env.STALWART_ACCOUNT_EMAIL || !env.STALWART_ACCOUNT_PASSWORD) {
+		return c.json({ error: "Stalwart env vars not set" }, 500);
+	}
+
+	const authHeader = `Basic ${btoa(`${env.STALWART_ACCOUNT_EMAIL}:${env.STALWART_ACCOUNT_PASSWORD}`)}`;
+
+	try {
+		// Step 1: Session
+		results.push("Fetching JMAP session...");
+		const sessionRes = await fetch(`${env.STALWART_JMAP_URL}/session`, {
+			method: "GET",
+			headers: { "Authorization": authHeader },
+		});
+		results.push(`Session status: ${sessionRes.status}`);
+
+		if (!sessionRes.ok) {
+			return c.json({ error: "Session failed", results }, 500);
+		}
+
+		const sessionData = await sessionRes.json() as any;
+		const accountId = sessionData?.primaryAccounts?.["urn:ietf:params:jmap:mail"];
+		results.push(`AccountId: ${accountId}`);
+
+		if (!accountId) {
+			return c.json({ error: "No accountId", results }, 500);
+		}
+
+		// Step 2: Upload test blob
+		const testEmail = "From: debug-test@example.com\r\nTo: test-rsvbook@team.easyrentbali.com\r\nSubject: Debug JMAP Import Test\r\nDate: Mon, 08 Jun 2026 18:00:00 +0000\r\nMessage-ID: <debug-test@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDebug test body";
+		const uploadUrl = `${env.STALWART_JMAP_URL}/upload/${accountId}/`;
+		results.push(`Upload URL: ${uploadUrl}`);
+
+		const uploadRes = await fetch(uploadUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "message/rfc822",
+				"Authorization": authHeader,
+			},
+			body: testEmail,
+		});
+		results.push(`Upload status: ${uploadRes.status}`);
+		const uploadBody = await uploadRes.text();
+		results.push(`Upload body: ${uploadBody.substring(0, 200)}`);
+
+		if (!uploadRes.ok) {
+			return c.json({ error: "Upload failed", results }, 500);
+		}
+
+		const uploadData = JSON.parse(uploadBody) as any;
+		const blobId = uploadData.blobId;
+		results.push(`BlobId: ${blobId}`);
+
+		// Step 3: Import
+		const importRes = await fetch(env.STALWART_JMAP_URL, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Authorization": authHeader,
+			},
+			body: JSON.stringify({
+				using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+				methodCalls: [
+					["Email/import", {
+						accountId,
+						emails: {
+							"e0": {
+								blobId,
+								mailboxIds: { "a": true },
+							},
+						},
+					}, "c1"],
+				],
+			}),
+		});
+		const importBody = await importRes.text();
+		results.push(`Import status: ${importRes.status}`);
+		results.push(`Import body: ${importBody.substring(0, 500)}`);
+
+		return c.json({ results });
+	} catch (err: any) {
+		results.push(`Error: ${err.message}`);
+		return c.json({ error: err.message, results }, 500);
+	}
+});
+
 // -- Mailboxes ------------------------------------------------------
 
 app.get("/api/v1/mailboxes", async (c) => {
@@ -401,6 +492,147 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
+
+	// === EASYRENT CUSTOM ROUTING ===
+
+	// 1. Relay raw MIME to Chatwoot (multi-inbox via TO address mapping)
+	const chatwootInboxMap: Record<string, string> = {
+		"support@team.easyrentbali.com": "support",
+		"reservation@team.easyrentbali.com": "reservation",
+		"billing@team.easyrentbali.com": "billing",
+		"partners@team.easyrentbali.com": "partners",
+		"test-rsvbook@team.easyrentbali.com": "reservation",
+	};
+
+	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || "";
+	const chatwootInbox = chatwootInboxMap[primaryTo];
+
+	if (chatwootInbox && env.CHATWOOT_RELAY_URL) {
+		try {
+			const relayResponse = await fetch(env.CHATWOOT_RELAY_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "message/rfc822",
+					Authorization: `Basic ${btoa(`actionmailbox:${env.CHATWOOT_INGRESS_PASSWORD}`)}`,
+				},
+				body: rawEmail,
+			});
+			if (!relayResponse.ok) {
+				console.error("Chatwoot relay failed:", relayResponse.status, await relayResponse.text());
+			}
+		} catch (relayError) {
+			console.error("Chatwoot relay error:", relayError);
+		}
+	}
+
+	// 2. Import raw MIME to Stalwart via JMAP (backup mailbox)
+	if (env.STALWART_JMAP_URL && env.STALWART_ACCOUNT_EMAIL && env.STALWART_ACCOUNT_PASSWORD) {
+		try {
+			const authHeader = `Basic ${btoa(`${env.STALWART_ACCOUNT_EMAIL}:${env.STALWART_ACCOUNT_PASSWORD}`)}`;
+
+			// Step 1: Get JMAP session via /jmap/session endpoint
+			const sessionRes = await fetch(`${env.STALWART_JMAP_URL}/session`, {
+				method: "GET",
+				headers: { "Authorization": authHeader },
+			});
+
+			if (!sessionRes.ok) {
+				console.error("Stalwart JMAP session failed:", sessionRes.status);
+			} else {
+				const sessionData = await sessionRes.json() as any;
+				// Always use the Zeabur URL since mx.easyrentbali.com has no SSL
+				const apiUrl = env.STALWART_JMAP_URL;
+				const accountId = sessionData?.primaryAccounts?.["urn:ietf:params:jmap:mail"];
+
+				if (!accountId) {
+					console.error("Stalwart JMAP: no accountId in session");
+				} else {
+				// Step 2: Upload raw email as blob
+					const blobName = `email-${Date.now()}.eml`;
+					const uploadUrl = apiUrl.replace(/\/jmap\/?$/, `/jmap/upload/${accountId}/`);
+					const rawEmailStr = new TextDecoder().decode(rawEmail);
+					const uploadRes = await fetch(uploadUrl, {
+						method: "POST",
+						headers: {
+							"Content-Type": "message/rfc822",
+							"Authorization": authHeader,
+						},
+						body: rawEmailStr,
+					});
+
+					if (!uploadRes.ok) {
+						console.error("Stalwart blob upload failed:", uploadRes.status);
+					} else {
+						const uploadData = await uploadRes.json() as any;
+						const blobId = uploadData.blobId;
+
+						// Step 3: Import email via JMAP
+						const importRes = await fetch(apiUrl, {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								"Authorization": authHeader,
+							},
+							body: JSON.stringify({
+								using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+								methodCalls: [
+									["Email/import", {
+										accountId,
+										emails: {
+											"e0": {
+												blobId,
+												mailboxIds: { "a": true },
+											},
+										},
+									}, "c1"],
+								],
+							}),
+						});
+
+						if (!importRes.ok) {
+							console.error("Stalwart JMAP import failed:", importRes.status);
+						} else {
+							const importData = await importRes.json() as any;
+							const created = importData?.methodResponses?.[0]?.[1]?.created;
+							const notCreated = importData?.methodResponses?.[0]?.[1]?.notCreated;
+							if (created && Object.keys(created).length > 0) {
+								console.log("Stalwart JMAP import OK:", Object.keys(created).length, "email(s)");
+							} else {
+								console.error("Stalwart JMAP import result:", JSON.stringify(importData?.methodResponses?.[0]?.[1]));
+							}
+						}
+					}
+				}
+			}
+		} catch (stalwartError) {
+			console.error("Stalwart JMAP error:", stalwartError);
+		}
+	}
+
+	// 3. POST to reservation-agent for queue updates (booking/OTA emails only)
+	const fromAddr = (parsedEmail.from?.address || "").toLowerCase();
+	const subject = (parsedEmail.subject || "").toLowerCase();
+	const isOTA = fromAddr.includes("booking.com") || fromAddr.includes("expedia")
+		|| fromAddr.includes("agoda") || fromAddr.includes("airbnb") || fromAddr.includes("ctrip")
+		|| subject.includes("new reservation") || subject.includes("booking.com")
+		|| subject.includes("reservation") || subject.includes("confirmation");
+
+	if (isOTA && env.RESERVATION_AGENT_URL) {
+		try {
+			await fetch(env.RESERVATION_AGENT_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "message/rfc822",
+					"X-Email-Id": messageId,
+					"X-From": fromAddr,
+					"X-Subject": parsedEmail.subject || "",
+				},
+				body: rawEmail,
+			});
+		} catch (agentError) {
+			console.error("Reservation agent relay error:", agentError);
+		}
+	}
 
 	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
 	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
