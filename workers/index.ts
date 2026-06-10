@@ -63,6 +63,62 @@ function boolQuery(c: AppContext, key: string): boolean | undefined {
 	return v === "true" || v === "1";
 }
 
+function parseList(value: string | string[] | undefined): string[] {
+	if (!value) return [];
+	if (Array.isArray(value)) return value.map((item) => item.trim()).filter(Boolean);
+
+	const trimmed = value.trim();
+	if (!trimmed) return [];
+
+	try {
+		const parsed = JSON.parse(trimmed);
+		if (Array.isArray(parsed)) {
+			return parsed.map((item) => String(item).trim()).filter(Boolean);
+		}
+	} catch {
+		// Fall through to comma-separated parsing.
+	}
+
+	return trimmed.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function hasValidApiKey(c: { req: { header(name: string): string | undefined }; env: Env }): boolean {
+	const apiKey = c.req.header("X-API-Key");
+	return Boolean(apiKey && apiKey === c.env.STALWART_ACCOUNT_PASSWORD);
+}
+
+async function getImportMessageId(rawEmail: ArrayBuffer, messageId?: string): Promise<string> {
+	if (messageId) {
+		const match = messageId.match(/<([^>]+)>/);
+		return match ? match[1] : messageId.trim().split(/\s+/)[0];
+	}
+
+	const digest = await crypto.subtle.digest("SHA-256", rawEmail);
+	return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+const CHATWOOT_INBOX_MAP: Record<string, string> = {
+	"support@team.easyrentbali.com": "support",
+	"reservation@team.easyrentbali.com": "reservation",
+	"billing@team.easyrentbali.com": "billing",
+	"partners@team.easyrentbali.com": "partners",
+	"test-rsvbook@team.easyrentbali.com": "reservation",
+	"accounting@easyrentbali.com": "accounting",
+	"cs@easyrentbali.com": "cs",
+	"director@easyrentbali.com": "director",
+	"fin.acct@easyrentbali.com": "fin-acct",
+	"finance@easyrentbali.com": "finance",
+	"gm@easyrentbali.com": "gm",
+	"info@easyrentbali.com": "info",
+	"jagoan@easyrentbali.com": "jagoan",
+	"job_career@easyrentbali.com": "job-career",
+	"manager@easyrentbali.com": "manager",
+	"marketing@easyrentbali.com": "marketing",
+	"reservation@easyrentbali.com": "reservation-erb",
+	"support@easyrentbali.com": "support-erb",
+	"tester@easyrentbali.com": "tester",
+};
+
 // -- App & middleware -----------------------------------------------
 
 const app = new Hono<MailboxContext>();
@@ -83,104 +139,225 @@ app.use("/api/*", cors({
 }));
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
+// -- Setup: Auto-create mailboxes from EMAIL_ADDRESSES --------------------
+
+app.post("/api/v1/setup", async (c) => {
+	if (!hasValidApiKey(c)) return c.json({ error: "Unauthorized" }, 401);
+
+	const allowedAddresses = parseList(c.env.EMAIL_ADDRESSES);
+	if (allowedAddresses.length === 0) {
+		return c.json({ error: "No EMAIL_ADDRESSES configured" }, 400);
+	}
+
+	const results: { email: string; status: string; error?: string }[] = [];
+
+	for (const email of allowedAddresses) {
+		const emailLower = email.toLowerCase();
+		const key = `mailboxes/${emailLower}.json`;
+
+		try {
+			// Check if mailbox already exists
+			if (await c.env.BUCKET.head(key)) {
+				results.push({ email: emailLower, status: "exists" });
+				continue;
+			}
+
+			// Extract name from email (e.g., "accounting" from "accounting@easyrentbali.com")
+			const name = emailLower.split("@")[0]
+				.replace(/[._-]/g, " ")
+				.replace(/\b\w/g, (l) => l.toUpperCase());
+
+			// Create mailbox settings
+			const settings = {
+				fromName: name,
+				forwarding: { enabled: false, email: "" },
+				signature: { enabled: false, text: "" },
+				autoReply: { enabled: false, subject: "", message: "" },
+			};
+
+			// Save mailbox config
+			await c.env.BUCKET.put(key, JSON.stringify(settings));
+
+			// Initialize the Durable Object
+			const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(emailLower));
+			await stub.getFolders();
+
+			results.push({ email: emailLower, status: "created" });
+		} catch (e: any) {
+			results.push({ email: emailLower, status: "error", error: e.message });
+		}
+	}
+
+	return c.json({
+		success: true,
+		total: allowedAddresses.length,
+		created: results.filter((r) => r.status === "created").length,
+		existing: results.filter((r) => r.status === "exists").length,
+		errors: results.filter((r) => r.status === "error").length,
+		results,
+	});
+});
+
 // -- Config ---------------------------------------------------------
 
 app.get("/api/v1/config", (c) => {
-	const domainsRaw = c.env.DOMAINS || "";
-	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
-	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
+	const domains = parseList(c.env.DOMAINS);
+	const emailAddresses = parseList(c.env.EMAIL_ADDRESSES);
 	return c.json({ domains, emailAddresses });
 });
 
-// -- Debug: Test Stalwart JMAP import -----------------------------------
+// -- Import: Bulk .eml import via raw MIME POST ----------------------------
 
-app.post("/api/v1/debug/stalwart-test", async (c: AppContext) => {
-	const env = c.env;
-	const results: string[] = [];
+app.post("/api/v1/import", async (c) => {
+	if (!hasValidApiKey(c)) return c.json({ error: "Unauthorized" }, 401);
 
-	if (!env.STALWART_JMAP_URL || !env.STALWART_ACCOUNT_EMAIL || !env.STALWART_ACCOUNT_PASSWORD) {
-		return c.json({ error: "Stalwart env vars not set" }, 500);
+	const contentType = c.req.header("content-type") || "";
+	if (!contentType.includes("message/rfc822") && !contentType.includes("application/octet-stream")) {
+		return c.json({ error: "Content-Type must be message/rfc822 or application/octet-stream" }, 400);
 	}
 
-	const authHeader = `Basic ${btoa(`${env.STALWART_ACCOUNT_EMAIL}:${env.STALWART_ACCOUNT_PASSWORD}`)}`;
+	const rawEmail = await c.req.arrayBuffer();
+	if (rawEmail.byteLength === 0) return c.json({ error: "Empty body" }, 400);
+	if (rawEmail.byteLength > MAX_EMAIL_SIZE) return c.json({ error: `Email too large: ${rawEmail.byteLength} bytes` }, 413);
 
+	const parsedEmail = await new PostalMime().parse(rawEmail);
+
+	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) {
+		return c.json({ error: "Email has no To address" }, 400);
+	}
+
+	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
+	const originalMessageId = await getImportMessageId(rawEmail, parsedEmail.messageId);
+
+	// Resolve mailbox — use To address or first allowed address
+	const allowedAddresses = parseList(c.env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
+	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const requestedMailbox = c.req.header("X-Mailbox-Id")?.trim().toLowerCase();
+	let mailboxId = requestedMailbox;
+	if (mailboxId && !allowedAddresses.includes(mailboxId)) {
+		return c.json({ error: "X-Mailbox-Id is not configured", mailbox: mailboxId }, 422);
+	}
+	if (allowedAddresses.length > 0) {
+		mailboxId ??= allRecipients.find((addr) => allowedAddresses.includes(addr));
+		if (!mailboxId) {
+			return c.json({ error: "No recipient matches EMAIL_ADDRESSES", recipients: allRecipients }, 422);
+		}
+	} else {
+		mailboxId = allRecipients[0];
+	}
+	if (!mailboxId) return c.json({ error: "No valid recipient address" }, 400);
+
+	// Ensure mailbox exists
+	if (!(await c.env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		return c.json({ error: `Mailbox ${mailboxId} does not exist` }, 404);
+	}
+
+	const messageId = crypto.randomUUID();
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const existingEmail = await stub.findEmailByMessageId(originalMessageId);
+	if (existingEmail) {
+		return c.json({
+			success: true,
+			duplicate: true,
+			message_id: existingEmail.id,
+			original_message_id: originalMessageId,
+			mailbox: mailboxId,
+		});
+	}
+
+	// Store attachments
+	const attachmentData: StoredAttachment[] = [];
+	if (parsedEmail.attachments) {
+		for (const att of parsedEmail.attachments) {
+			const attId = crypto.randomUUID();
+			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+			await c.env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
+			attachmentData.push({
+				id: attId, email_id: messageId, filename, mimetype: att.mimeType,
+				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+				content_id: att.contentId || null, disposition: att.disposition || "attachment",
+			});
+		}
+	}
+
+	// Thread detection
+	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
+	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
+	let threadId = emailReferences[0] || inReplyTo || messageId;
+
+	if (!inReplyTo && emailReferences.length === 0) {
+		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
+		if (subjectThread) threadId = subjectThread;
+	}
+
+	// Use the email's own Date header for imported emails (not receive time)
+	const emailDate = parsedEmail.date ? new Date(parsedEmail.date).toISOString() : new Date().toISOString();
+
+	// Create email in inbox
+	await stub.createEmail(Folders.INBOX, {
+		id: messageId, subject: parsedEmail.subject || "",
+		sender: (parsedEmail.from?.address || "").toLowerCase(),
+		recipient: allRecipients.join(", "),
+		cc: (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean).join(", ") || null,
+		bcc: (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean).join(", ") || null,
+		date: emailDate,
+		body: parsedEmail.html || parsedEmail.text || "",
+		in_reply_to: inReplyTo,
+		email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+		thread_id: threadId, message_id: originalMessageId,
+		raw_headers: JSON.stringify(parsedEmail.headers),
+	}, attachmentData);
+
+	// === FAN-OUT: Same as receiveEmail ===
+
+	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || "";
+	const chatwootInbox = CHATWOOT_INBOX_MAP[primaryTo];
+
+	let chatwootConversationId: number | undefined;
+	if (chatwootInbox && c.env.CHATWOOT_RELAY_URL) {
+		try {
+			const relayBody = allRecipients.includes(mailboxId)
+				? rawEmail
+				: new Blob([`Delivered-To: ${mailboxId}\r\nX-Original-To: ${mailboxId}\r\n`, rawEmail]);
+			const relayResponse = await fetch(c.env.CHATWOOT_RELAY_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "message/rfc822",
+					Authorization: `Basic ${btoa(`actionmailbox:${c.env.CHATWOOT_INGRESS_PASSWORD}`)}`,
+				},
+				body: relayBody,
+			});
+			if (relayResponse.ok) {
+				const relayData = await relayResponse.json() as any;
+				chatwootConversationId = relayData?.id;
+			} else {
+				console.error("Chatwoot relay failed:", relayResponse.status);
+			}
+		} catch (e) {
+			console.error("Chatwoot relay error:", e);
+		}
+	}
+
+	// 2. R2 cold storage
 	try {
-		// Step 1: Session
-		results.push("Fetching JMAP session...");
-		const sessionRes = await fetch(`${env.STALWART_JMAP_URL}/session`, {
-			method: "GET",
-			headers: { "Authorization": authHeader },
-		});
-		results.push(`Session status: ${sessionRes.status}`);
-
-		if (!sessionRes.ok) {
-			return c.json({ error: "Session failed", results }, 500);
-		}
-
-		const sessionData = await sessionRes.json() as any;
-		const accountId = sessionData?.primaryAccounts?.["urn:ietf:params:jmap:mail"];
-		results.push(`AccountId: ${accountId}`);
-
-		if (!accountId) {
-			return c.json({ error: "No accountId", results }, 500);
-		}
-
-		// Step 2: Upload test blob
-		const testEmail = "From: debug-test@example.com\r\nTo: test-rsvbook@team.easyrentbali.com\r\nSubject: Debug JMAP Import Test\r\nDate: Mon, 08 Jun 2026 18:00:00 +0000\r\nMessage-ID: <debug-test@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDebug test body";
-		const uploadUrl = `${env.STALWART_JMAP_URL}/upload/${accountId}/`;
-		results.push(`Upload URL: ${uploadUrl}`);
-
-		const uploadRes = await fetch(uploadUrl, {
-			method: "POST",
-			headers: {
-				"Content-Type": "message/rfc822",
-				"Authorization": authHeader,
-			},
-			body: testEmail,
-		});
-		results.push(`Upload status: ${uploadRes.status}`);
-		const uploadBody = await uploadRes.text();
-		results.push(`Upload body: ${uploadBody.substring(0, 200)}`);
-
-		if (!uploadRes.ok) {
-			return c.json({ error: "Upload failed", results }, 500);
-		}
-
-		const uploadData = JSON.parse(uploadBody) as any;
-		const blobId = uploadData.blobId;
-		results.push(`BlobId: ${blobId}`);
-
-		// Step 3: Import
-		const importRes = await fetch(env.STALWART_JMAP_URL, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"Authorization": authHeader,
-			},
-			body: JSON.stringify({
-				using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-				methodCalls: [
-					["Email/import", {
-						accountId,
-						emails: {
-							"e0": {
-								blobId,
-								mailboxIds: { "a": true },
-							},
-						},
-					}, "c1"],
-				],
-			}),
-		});
-		const importBody = await importRes.text();
-		results.push(`Import status: ${importRes.status}`);
-		results.push(`Import body: ${importBody.substring(0, 500)}`);
-
-		return c.json({ results });
-	} catch (err: any) {
-		results.push(`Error: ${err.message}`);
-		return c.json({ error: err.message, results }, 500);
+		const r2Key = `archive/${mailboxId}/${new Date().toISOString().slice(0, 10)}/${messageId}.eml`;
+		await c.env.BUCKET.put(r2Key, rawEmail);
+	} catch (e) {
+		console.error("R2 archive error:", e);
 	}
+
+	return c.json({
+		success: true,
+		message_id: messageId,
+		original_message_id: originalMessageId,
+		mailbox: mailboxId,
+		subject: parsedEmail.subject || "",
+		from: parsedEmail.from?.address || "",
+		date: emailDate,
+		chatwoot_conversation_id: chatwootConversationId || null,
+		stalwart_email_id: null,
+		is_ota: false,
+	}, 201);
 });
 
 // -- Mailboxes ------------------------------------------------------
@@ -193,7 +370,7 @@ app.get("/api/v1/mailboxes", async (c) => {
 app.post("/api/v1/mailboxes", async (c) => {
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
 	const email = rawEmail.toLowerCase();
-	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
+	const allowedAddresses = parseList(c.env.EMAIL_ADDRESSES);
 	if (allowedAddresses.length > 0 && !allowedAddresses.map((a) => a.toLowerCase()).includes(email)) {
 		return c.json({ error: "Mailbox creation is restricted to configured EMAIL_ADDRESSES" }, 403);
 	}
@@ -442,7 +619,7 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
+	const allowedAddresses = parseList(env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
@@ -495,17 +672,8 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	// === EASYRENT CUSTOM ROUTING ===
 
-	// 1. Relay raw MIME to Chatwoot (multi-inbox via TO address mapping)
-	const chatwootInboxMap: Record<string, string> = {
-		"support@team.easyrentbali.com": "support",
-		"reservation@team.easyrentbali.com": "reservation",
-		"billing@team.easyrentbali.com": "billing",
-		"partners@team.easyrentbali.com": "partners",
-		"test-rsvbook@team.easyrentbali.com": "reservation",
-	};
-
 	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || "";
-	const chatwootInbox = chatwootInboxMap[primaryTo];
+	const chatwootInbox = CHATWOOT_INBOX_MAP[primaryTo];
 
 	if (chatwootInbox && env.CHATWOOT_RELAY_URL) {
 		try {

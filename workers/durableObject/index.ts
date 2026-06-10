@@ -459,6 +459,15 @@ export class MailboxDO extends DurableObject<Env> {
 		};
 	}
 
+	async findEmailByMessageId(messageId: string) {
+		return this.db
+			.select({ id: schema.emails.id })
+			.from(schema.emails)
+			.where(eq(schema.emails.message_id, messageId))
+			.limit(1)
+			.get() ?? null;
+	}
+
 	/**
 	 * Fetch all emails in a thread with full bodies and attachments in
 	 * two queries (one for emails, one for attachments) instead of

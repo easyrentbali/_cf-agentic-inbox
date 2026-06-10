@@ -44,9 +44,21 @@ const app = new Hono<{ Bindings: Env }>();
 
 // Cloudflare Access JWT validation middleware (production only)
 app.use("*", async (c, next) => {
-	// Skip validation in development or for debug endpoints
-	if (import.meta.env.DEV || c.req.path.startsWith("/api/v1/debug")) {
+	if (import.meta.env.DEV) {
 		return next();
+	}
+
+	const apiKeyPaths = new Set([
+		"POST /api/v1/setup",
+		"POST /api/v1/import",
+		"POST /api/v1/mailboxes",
+		"GET /api/v1/mailboxes",
+	]);
+	if (apiKeyPaths.has(`${c.req.method} ${c.req.path}`)) {
+		const apiKey = c.req.header("X-API-Key");
+		if (apiKey === c.env.STALWART_ACCOUNT_PASSWORD) {
+			return next();
+		}
 	}
 
 	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
