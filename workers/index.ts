@@ -222,16 +222,12 @@ app.post("/api/v1/import", async (c) => {
 
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) {
-		return c.json({ error: "Email has no To address" }, 400);
-	}
-
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
 	const originalMessageId = await getImportMessageId(rawEmail, parsedEmail.messageId);
 
-	// Resolve mailbox — use To address or first allowed address
+	// Resolve mailbox — prefer explicit override, then To address.
 	const allowedAddresses = parseList(c.env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const allRecipients = parsedEmail.to?.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[] || [];
 	const requestedMailbox = c.req.header("X-Mailbox-Id")?.trim().toLowerCase();
 	let mailboxId = requestedMailbox;
 	if (mailboxId && !allowedAddresses.includes(mailboxId)) {
@@ -297,7 +293,7 @@ app.post("/api/v1/import", async (c) => {
 	await stub.createEmail(Folders.INBOX, {
 		id: messageId, subject: parsedEmail.subject || "",
 		sender: (parsedEmail.from?.address || "").toLowerCase(),
-		recipient: allRecipients.join(", "),
+		recipient: allRecipients.join(", ") || mailboxId,
 		cc: (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean).join(", ") || null,
 		bcc: (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean).join(", ") || null,
 		date: emailDate,
@@ -310,7 +306,7 @@ app.post("/api/v1/import", async (c) => {
 
 	// === FAN-OUT: Same as receiveEmail ===
 
-	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || "";
+	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || mailboxId || "";
 	const chatwootInbox = CHATWOOT_INBOX_MAP[primaryTo];
 
 	let chatwootConversationId: number | undefined;
