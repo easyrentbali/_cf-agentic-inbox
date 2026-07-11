@@ -3,6 +3,7 @@
 	"name": "agentic-inbox",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
+	"preview_urls": true,
 	"observability": {
 		"enabled": true
 	},

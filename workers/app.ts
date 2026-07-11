@@ -51,10 +51,19 @@ app.use("*", async (c, next) => {
 	const apiKeyPaths = new Set([
 		"POST /api/v1/setup",
 		"POST /api/v1/import",
+		"POST /api/v1/archive",
+		"POST /api/v1/import-reference",
 		"POST /api/v1/mailboxes",
 		"GET /api/v1/mailboxes",
 	]);
-	if (apiKeyPaths.has(`${c.req.method} ${c.req.path}`)) {
+	// Read-only inbox routes that the reservation-agent cron sweep reads with an
+	// X-API-Key (server-to-server). Matched by pattern since they carry IDs.
+	const apiKeyPatterns: RegExp[] = [
+		/^GET \/api\/v1\/mailboxes\/[^/]+\/emails$/,
+		/^GET \/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+$/,
+	];
+	const reqSig = `${c.req.method} ${c.req.path}`;
+	if (apiKeyPaths.has(reqSig) || apiKeyPatterns.some((re) => re.test(reqSig))) {
 		const apiKey = c.req.header("X-API-Key");
 		if (apiKey === c.env.STALWART_ACCOUNT_PASSWORD) {
 			return next();

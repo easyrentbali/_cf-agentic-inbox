@@ -309,8 +309,9 @@ app.post("/api/v1/import", async (c) => {
 	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || mailboxId || "";
 	const chatwootInbox = CHATWOOT_INBOX_MAP[primaryTo];
 
+	const skipChatwoot = c.req.header("X-Skip-Chatwoot") != null;
 	let chatwootConversationId: number | undefined;
-	if (chatwootInbox && c.env.CHATWOOT_RELAY_URL) {
+	if (!skipChatwoot && chatwootInbox && c.env.CHATWOOT_RELAY_URL) {
 		try {
 			const relayBody = allRecipients.includes(mailboxId)
 				? rawEmail
@@ -354,6 +355,66 @@ app.post("/api/v1/import", async (c) => {
 		stalwart_email_id: null,
 		is_ota: false,
 	}, 201);
+});
+
+// Archive raw MIME to R2 cold storage. Used by the bulk importer for oversized
+// emails that exceed MAX_EMAIL_SIZE on /import.
+app.post("/api/v1/archive", async (c) => {
+	if (!hasValidApiKey(c)) return c.json({ error: "Unauthorized" }, 401);
+	const mailboxId = c.req.header("X-Mailbox-Id")?.trim().toLowerCase();
+	if (!mailboxId) return c.json({ error: "X-Mailbox-Id required" }, 400);
+	const raw = await c.req.arrayBuffer();
+	if (raw.byteLength === 0) return c.json({ error: "Empty body" }, 400);
+	const messageId = crypto.randomUUID();
+	const r2Key = `archive/${mailboxId}/${new Date().toISOString().slice(0, 10)}/${messageId}.eml`;
+	await c.env.BUCKET.put(r2Key, raw);
+	return c.json({ success: true, r2_key: r2Key }, 201);
+});
+
+// Metadata-only inbox insert (no raw body). Used by the bulk importer for
+// oversized emails: the full MIME goes to R2 via /archive, headers+body here.
+app.post("/api/v1/import-reference", async (c) => {
+	if (!hasValidApiKey(c)) return c.json({ error: "Unauthorized" }, 401);
+	const ref = await c.req.json() as Record<string, any>;
+	const allowedAddresses = parseList(c.env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
+	const mailboxId = (c.req.header("X-Mailbox-Id")?.trim().toLowerCase()) || (ref.mailbox || "").toLowerCase();
+	if (!mailboxId) return c.json({ error: "No mailbox" }, 400);
+	if (allowedAddresses.length > 0 && !allowedAddresses.includes(mailboxId)) {
+		return c.json({ error: "Mailbox not configured", mailbox: mailboxId }, 422);
+	}
+	if (!(await c.env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		return c.json({ error: `Mailbox ${mailboxId} does not exist` }, 404);
+	}
+
+	const originalMessageId = ref.message_id || ref.sha256;
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const existingEmail = await stub.findEmailByMessageId(originalMessageId);
+	if (existingEmail) {
+		return c.json({ success: true, duplicate: true, message_id: existingEmail.id, mailbox: mailboxId });
+	}
+
+	const messageId = crypto.randomUUID();
+	const refList = ref.references ? String(ref.references).split(/\s+/).filter(Boolean) : [];
+	const threadId = refList[0] || ref.in_reply_to || messageId;
+	const emailDate = ref.date ? new Date(ref.date).toISOString() : new Date().toISOString();
+
+	await stub.createEmail(Folders.INBOX, {
+		id: messageId,
+		subject: ref.subject || "",
+		sender: (ref.sender || "").toLowerCase(),
+		recipient: ref.recipient || mailboxId,
+		cc: ref.cc || null,
+		bcc: ref.bcc || null,
+		date: emailDate,
+		body: ref.body || "",
+		in_reply_to: ref.in_reply_to || null,
+		email_references: refList.length > 0 ? JSON.stringify(refList) : null,
+		thread_id: threadId,
+		message_id: originalMessageId,
+		raw_headers: ref.raw_headers ? JSON.stringify(ref.raw_headers) : null,
+	}, []);
+
+	return c.json({ success: true, message_id: messageId, original_message_id: originalMessageId, mailbox: mailboxId }, 201);
 });
 
 // -- Mailboxes ------------------------------------------------------
@@ -773,13 +834,25 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		}
 	}
 
-	// 3. POST to reservation-agent for queue updates (booking/OTA emails only)
+	// 3. POST to reservation-agent for queue updates (OTA emails only).
+	// Gate on the OTA sender ALLOWLIST (exact from-address) — far fewer false
+	// positives/negatives than keyword matching. Kept in sync with
+	// apps/erp/src/lib/ota-sources.ts + reservation-agent/src/inbox-sweep.ts.
 	const fromAddr = (parsedEmail.from?.address || "").toLowerCase();
-	const subject = (parsedEmail.subject || "").toLowerCase();
-	const isOTA = fromAddr.includes("booking.com") || fromAddr.includes("expedia")
-		|| fromAddr.includes("agoda") || fromAddr.includes("airbnb") || fromAddr.includes("ctrip")
-		|| subject.includes("new reservation") || subject.includes("booking.com")
-		|| subject.includes("reservation") || subject.includes("confirmation");
+	const OTA_SENDERS = [
+		"reservationsdept@cartrawler.com",
+		"noreply@cartrawler.com",
+		"xczc_tzzy@trip.com",
+		"support@qbookingsolutions.com",
+		"admin@email.yesaway.com",
+		"booking@zuzuche.com",
+		"confirmations@bookinggroup.com",
+		"reservations@economycarrentals.com",
+		"joanna@economycarrentals.com",
+		"mail@localrent.com",
+		"support@driveo.asia",
+	];
+	const isOTA = OTA_SENDERS.some((addr) => fromAddr.includes(addr));
 
 	if (isOTA && env.RESERVATION_AGENT_URL) {
 		try {
