@@ -827,11 +827,26 @@ export class MailboxDO extends DurableObject<Env> {
 
 	// ── Email creation (Drizzle) ───────────────────────────────────
 
+	/** Atomic mailbox-local deduplication for native delivery retries. */
+	async createInboundEmail(email: EmailData, attachments: AttachmentData[]) {
+		return this.ctx.storage.transactionSync(() => {
+			const existing = this.db.select({ id: schema.emails.id }).from(schema.emails)
+				.where(eq(schema.emails.message_id, email.message_id!)).limit(1).get();
+			if (existing) return { created: false, id: existing.id };
+			this.insertEmail(Folders.INBOX, email, attachments);
+			return { created: true, id: email.id };
+		});
+	}
+
 	async createEmail(
 		folder: string,
 		email: EmailData,
 		attachments: AttachmentData[],
 	) {
+		this.insertEmail(folder, email, attachments);
+	}
+
+	private insertEmail(folder: string, email: EmailData, attachments: AttachmentData[]) {
 		// Resolve folder name or ID to the actual folder ID.
 		const folderRow = this.db
 			.select({ id: schema.folders.id })

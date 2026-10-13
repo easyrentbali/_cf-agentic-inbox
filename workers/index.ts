@@ -670,28 +670,29 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
-
 	const allowedAddresses = parseList(env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const allRecipients = (parsedEmail.to || []).map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	// Cloudflare invokes this handler for each envelope recipient, including CC/BCC.
+	const mailboxId = event.to?.trim().toLowerCase();
+	if (!mailboxId || (allowedAddresses.length > 0 && !allowedAddresses.includes(mailboxId))) {
+		throw new Error("Incoming envelope recipient is not configured");
+	}
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		throw new Error(`Incoming mailbox does not exist: ${mailboxId}`);
+	}
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+	const originalMessageId = await getImportMessageId(rawEmail.buffer, parsedEmail.messageId);
+	if (await stub.findEmailByMessageId(originalMessageId)) return;
 
 	const attachmentData: StoredAttachment[] = [];
 	if (parsedEmail.attachments) {
@@ -715,9 +716,7 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		if (subjectThread) threadId = subjectThread;
 	}
 
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
-
-	await stub.createEmail(Folders.INBOX, {
+	const stored = await stub.createInboundEmail({
 		id: messageId, subject: parsedEmail.subject || "",
 		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
@@ -726,10 +725,20 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
+	if (!stored.created) return;
+
+	// Preserve the original MIME, attachments, and sender authentication on the Gmail copy.
+	if (mailboxId === "reservation@easyrentbali.com") {
+		try {
+			await event.forward("reservation.easyrentbali@gmail.com");
+		} catch (error) {
+			console.error("Reservation Gmail fan-out failed:", (error as Error).message);
+		}
+	}
 
 	// === EASYRENT CUSTOM ROUTING ===
 
-	const primaryTo = parsedEmail.to?.[0]?.address?.toLowerCase() || "";
+	const primaryTo = mailboxId;
 	const chatwootInbox = CHATWOOT_INBOX_MAP[primaryTo];
 
 	if (chatwootInbox && env.CHATWOOT_RELAY_URL) {
