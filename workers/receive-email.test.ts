@@ -74,12 +74,14 @@ describe("native delivery recipient", () => {
 		assert.equal(f.stores.get("marketing@easyrentbali.com")?.length, 1);
 		assert.equal(f.triggers.length, 1);
 	});
-	it("keeps Gmail forwarding scoped to reservation after inbox storage", async () => {
+	it("keeps Gmail copies for Reservation and Marketing after inbox storage", async () => {
 		const f = fixture();
 		await f.deliver("reservation@easyrentbali.com");
 		await f.deliver("marketing@easyrentbali.com");
 		assert.equal(f.stores.get("reservation@easyrentbali.com")?.length, 1);
-		assert.deepEqual(f.forwards, ["reservation.easyrentbali@gmail.com"]);
+		assert.equal(f.stores.get("marketing@easyrentbali.com")?.length, 1);
+		await f.deliver("finance@easyrentbali.com");
+		assert.deepEqual(f.forwards, ["reservation.easyrentbali@gmail.com", "marketing.easyrentbali@gmail.com"]);
 	});
 	it("preserves attachments in the CC mailbox", async () => {
 		const f = fixture();

@@ -20,6 +20,7 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import { restoreAttachments } from "./lib/restore-attachments";
 
 type AppContext = Context<MailboxContext>;
 
@@ -636,11 +637,24 @@ app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
 
 // -- Attachments ----------------------------------------------------
 
+app.post("/api/v1/mailboxes/:mailboxId/emails/:emailId/restore-attachments", async (c: AppContext) => {
+	if (!hasValidApiKey(c)) return c.json({ error: "Unauthorized" }, 401);
+	const input = z.object({ sourceMailbox: z.string().email(), sourceId: z.string().uuid() }).safeParse(await c.req.json());
+	if (!input.success) return c.json({ error: "Invalid source identity" }, 400);
+	const { sourceMailbox, sourceId } = input.data;
+	if (!(await c.env.BUCKET.head(`mailboxes/${sourceMailbox}.json`))) return c.json({ error: "Source mailbox not found" }, 404);
+	try {
+		return c.json(await restoreAttachments(c.env, decodeURIComponent(c.req.param("mailboxId")!), c.req.param("emailId")!, sourceMailbox, sourceId));
+	} catch {
+		return c.json({ error: "Attachments could not be restored from matching source" }, 409);
+	}
+});
+
 app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId", async (c: AppContext) => {
 	const emailId = c.req.param("emailId")!;
 	const attachmentId = c.req.param("attachmentId")!;
 	const attachment = await c.var.mailboxStub.getAttachment(attachmentId);
-	if (!attachment) return c.json({ error: "Attachment not found" }, 404);
+	if (!attachment || attachment.email_id !== emailId) return c.json({ error: "Attachment not found" }, 404);
 	const obj = await c.env.BUCKET.get(`attachments/${emailId}/${attachmentId}/${attachment.filename}`);
 	if (!obj) return c.json({ error: "Attachment file not found" }, 404);
 	const headers = new Headers();
@@ -728,11 +742,15 @@ async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: Execu
 	if (!stored.created) return;
 
 	// Preserve the original MIME, attachments, and sender authentication on the Gmail copy.
-	if (mailboxId === "reservation@easyrentbali.com") {
+	const gmailDestination = ({
+		"reservation@easyrentbali.com": "reservation.easyrentbali@gmail.com",
+		"marketing@easyrentbali.com": "marketing.easyrentbali@gmail.com",
+	} as Record<string, string>)[mailboxId];
+	if (gmailDestination) {
 		try {
-			await event.forward("reservation.easyrentbali@gmail.com");
+			await event.forward(gmailDestination);
 		} catch (error) {
-			console.error("Reservation Gmail fan-out failed:", (error as Error).message);
+			console.error("Gmail fan-out failed:", mailboxId, (error as Error).message);
 		}
 	}
 

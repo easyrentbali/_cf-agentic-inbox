@@ -827,6 +827,18 @@ export class MailboxDO extends DurableObject<Env> {
 
 	// ── Email creation (Drizzle) ───────────────────────────────────
 
+	/** Fill attachment metadata only when the matching message has none. */
+	async restoreMissingAttachments(emailId: string, messageId: string, attachments: AttachmentData[]) {
+		return this.ctx.storage.transactionSync(() => {
+			const email = this.db.select().from(schema.emails).where(eq(schema.emails.id, emailId)).get();
+			if (!email || email.message_id !== messageId) throw new Error("Message identity mismatch");
+			if (this.db.select().from(schema.attachments).where(eq(schema.attachments.email_id, emailId)).limit(1).get()) return 0;
+			if (attachments.some(a => a.email_id !== emailId)) throw new Error("Attachment ownership mismatch");
+			if (attachments.length) this.db.insert(schema.attachments).values(attachments).run();
+			return attachments.length;
+		});
+	}
+
 	/** Atomic mailbox-local deduplication for native delivery retries. */
 	async createInboundEmail(email: EmailData, attachments: AttachmentData[]) {
 		return this.ctx.storage.transactionSync(() => {

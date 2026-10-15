@@ -59,6 +59,7 @@ app.use("*", async (c, next) => {
 	// Read-only inbox routes that the reservation-agent cron sweep reads with an
 	// X-API-Key (server-to-server). Matched by pattern since they carry IDs.
 	const apiKeyPatterns: RegExp[] = [
+		/^POST \/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+\/restore-attachments$/,
 		/^GET \/api\/v1\/mailboxes\/[^/]+\/emails$/,
 		/^GET \/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+$/,
 	];
