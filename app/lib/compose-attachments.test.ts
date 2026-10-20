@@ -21,3 +21,7 @@ it("round trips inline previews to MIME references without touching other URLs",
 	assert.equal(outgoing, '<img src="cid:unique@compose"><img src="https://example.com/a.png">');
 	assert.equal(previewComposeBody(outgoing, [attachment]), body);
 });
+it("converts data URLs regardless of quote style or repeated occurrences", () => {
+	const attachment = { filename: "a.png", content: "AA==", type: "image/png", disposition: "inline" as const, contentId: "unique@compose" };
+	assert.equal(prepareComposeBody("<img src='data:image/png;base64,AA=='><img src=\"data:image/png;base64,AA==\">", [attachment]), "<img src='cid:unique@compose'><img src=\"cid:unique@compose\">");
+});

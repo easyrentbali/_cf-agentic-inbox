@@ -23,7 +23,12 @@ export async function encodeAttachment(file: File, inline = false): Promise<Comp
 export function attachmentPreview(item: ComposeAttachment) { return `data:${item.type};base64,${item.content}`; }
 
 export function prepareComposeBody(body: string, attachments: ComposeAttachment[]) {
-	return attachments.reduce((html, item) => item.contentId ? html.split(`src="${attachmentPreview(item)}"`).join(`src="cid:${item.contentId}"`) : html, body);
+	return attachments.reduce((html, item) => {
+		if (!item.contentId) return html;
+		const dataUrl = attachmentPreview(item);
+		const escaped = dataUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		return html.replace(new RegExp(escaped, "g"), `cid:${item.contentId}`);
+	}, body);
 }
 
 export function previewComposeBody(body: string, attachments: ComposeAttachment[]) {
