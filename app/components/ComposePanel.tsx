@@ -27,6 +27,7 @@ export default function ComposePanel() {
 		setSubject,
 		body,
 		setBody,
+		attachments, addAttachments, removeAttachment, isLoadingAttachments, attachmentLoadFailed,
 		error,
 		isSavingDraft,
 		isSending,
@@ -144,6 +145,7 @@ export default function ComposePanel() {
 						<RichTextEditor
 							value={body}
 							onChange={setBody}
+							attachments={attachments} onAttach={addAttachments} onRemoveAttachment={removeAttachment} disabled={isSending || isSavingDraft || isLoadingAttachments || attachmentLoadFailed}
 						/>
 					</div>
 				</div>
@@ -160,7 +162,7 @@ export default function ComposePanel() {
 								variant="secondary"
 								size="sm"
 								loading={isSavingDraft}
-								disabled={isSending}
+								disabled={isSending || isLoadingAttachments || attachmentLoadFailed}
 								icon={<FloppyDiskIcon size={14} />}
 								onClick={handleSaveDraft}
 							>
@@ -171,7 +173,7 @@ export default function ComposePanel() {
 								variant="primary"
 								size="sm"
 								loading={isSending}
-								disabled={isSavingDraft || isSending}
+								disabled={isSavingDraft || isSending || isLoadingAttachments || attachmentLoadFailed}
 								icon={<PaperPlaneTiltIcon size={14} />}
 							>
 								{isSending ? "Sending..." : "Send"}
