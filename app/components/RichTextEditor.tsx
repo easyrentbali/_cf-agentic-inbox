@@ -255,13 +255,6 @@ export default function RichTextEditor({
 			</div>
 
 			{/* Editor content */}
-			{onAttach && <div className="px-3 py-2 text-xs text-kumo-subtle">
-				<p>Attachments and images: 10 MiB total maximum.</p>
-				{attachments.map((item, index) => <div key={item.contentId || `${index}-${item.filename}`} className="flex items-center gap-2 py-1">
-					<span className="truncate">{item.filename}{item.disposition === "inline" ? " (inline image)" : ""}</span>
-					<button type="button" disabled={disabled} aria-label={`Remove ${item.filename}`} onClick={() => onRemoveAttachment?.(index)} className="text-kumo-link">Remove</button>
-				</div>)}
-			</div>}
 			<div className="flex-1 overflow-y-auto">
 				<EditorContent editor={editor} />
 			</div>
